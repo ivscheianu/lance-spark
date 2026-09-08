@@ -53,8 +53,6 @@ case class ShowIndexesExec(
 
     val dataset = Utils.openDatasetBuilder(readOptions).build()
     try {
-      // Group by logical index: one row per name, with every physical segment kept so segment-level
-      // metadata can be aggregated.
       val indexes = dataset.getIndexes.asScala.toSeq
         .filterNot(idx => ShowIndexesExec.isSystemIndex(idx.name()))
         .groupBy(_.name())
@@ -100,7 +98,6 @@ case class ShowIndexesExec(
         val numUnindexedFragments = getLong("num_unindexed_fragments")
         val numUnindexedRows = getLong("num_unindexed_rows")
 
-        // Truncated (not rounded) so it never overstates coverage. Null for empty tables.
         val indexedPercent: java.lang.Double =
           if (numIndexedRows == null || numUnindexedRows == null) {
             null
@@ -114,14 +111,11 @@ case class ShowIndexesExec(
             }
           }
 
-        // Physical segments backing this logical index. Older cores report only `num_indices`.
         val numSegments = {
           val reported = getLong("num_segments")
           if (reported != null) reported else getLong("num_indices")
         }
 
-        // Total across segments, or null when any segment predates index file size tracking: a
-        // partial sum would understate the index rather than admit it is unknown.
         val sizeBytes: java.lang.Long = {
           val perSegment = indexSegments.map(segment => segment.getSizeBytes)
           if (perSegment.exists(!_.isPresent)) {
