@@ -1,3 +1,9 @@
+# MinIO is archived (https://github.com/minio/minio — repo marked archived, dl.min.io returns
+# 410 Gone). This is the last release with a multi-arch container image (amd64 + arm64); the
+# later hotfix images on quay.io are amd64-only, and RELEASE.2025-10-15T17-29-55Z (the final
+# GitHub release) was never published as a container.
+FROM quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z AS minio-bin
+
 FROM ubuntu:24.04
 
 RUN apt-get update && \
@@ -14,8 +20,7 @@ RUN apt-get update && \
 
 RUN npm install -g azurite
 
-RUN curl -fL -o /usr/local/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio && \
-    chmod +x /usr/local/bin/minio
+COPY --from=minio-bin /usr/bin/minio /usr/local/bin/minio
 
 RUN python3 -m venv /opt/venv && \
     . /opt/venv/bin/activate && \
@@ -24,7 +29,7 @@ RUN python3 -m venv /opt/venv && \
 
 ENV PATH="/opt/venv/bin:$PATH"
 ENV SPARK_HOME="/opt/spark"
-ENV PYTHONPATH="${SPARK_HOME}/python:${PYTHONPATH}"
+ENV PYTHONPATH="${SPARK_HOME}/python"
 ENV PATH="${SPARK_HOME}/sbin:${SPARK_HOME}/bin:${PATH}"
 
 ARG SPARK_DOWNLOAD_VERSION=4.0.0
