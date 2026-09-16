@@ -626,6 +626,15 @@ class IndexUtilsTest {
   }
 
   @Test
+  def retainedSegments_returnsEmptyWhenAllSegmentsCoverOnlyRetiredFragments(): Unit = {
+    val result = IndexUtils.retainedSegments(
+      Seq(namedSegment("idx_id", 5, 6)),
+      "idx_id",
+      Set(0, 1))
+    assertEquals(Seq.empty, result)
+  }
+
+  @Test
   def retainedSegments_matchesIndexNameExactly(): Unit = {
     assertThrows(
       classOf[IllegalStateException],

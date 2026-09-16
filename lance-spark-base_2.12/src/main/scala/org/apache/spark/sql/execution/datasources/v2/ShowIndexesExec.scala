@@ -24,8 +24,6 @@ import org.lance.spark.utils.{FieldPathUtils, Utils}
 
 import scala.collection.JavaConverters._
 
-object ShowIndexesExec
-
 /**
  * Physical execution of SHOW INDEXES for Lance datasets.
  *

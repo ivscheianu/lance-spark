@@ -523,17 +523,9 @@ class ScalarSegmentIndexJob(
 
 final private[v2] case class FragmentWorkload(fragmentId: Integer, numRows: Long)
 
-/**
- * A task to create a scalar index segment on a batch of fragments.
- *
- * The segment is named after the logical index it will join, and {@code replace} is set because that
- * index may already exist: on the uncommitted build path Lance consults {@code replace} only to
- * reject a name that is already taken, which is precisely the normal case for a REFRESH, and for a
- * CREATE INDEX that replaces an index of the same name. Nothing is removed here — the driver's
- * single {@code commitExistingIndexSegments} transaction decides which existing segments to keep.
- * Leaving the name unset instead makes Lance derive its own default (`{column}_idx`) and reject the
- * build whenever an index of that name exists on the column.
- */
+// Named after the index it joins with replace=true: on the uncommitted path Lance uses replace only
+// to skip its name collision check. Without it, Lance derives `{column}_idx` and rejects the build
+// when that name is taken.
 case class ScalarSegmentIndexTask(
     encodedReadOptions: String,
     indexName: String,
@@ -629,8 +621,7 @@ object IndexUtils extends Logging {
     IndexType.RTREE -> "rtree",
     IndexType.INVERTED -> "inverted")
 
-  // Reverse of `methodToIndexTypes`, for commands that resolve an already-created index and need
-  // the method name back. INVERTED maps to the canonical "fts" spelling rather than its alias.
+  // INVERTED maps to the canonical "fts" spelling.
   private val methodByIndexType: Map[IndexType, String] = Map(
     IndexType.BTREE -> "btree",
     IndexType.ZONEMAP -> "zonemap",
@@ -754,28 +745,15 @@ object IndexUtils extends Logging {
     if (ordered.size > 10) s"$shown, ... (${ordered.size} total)" else shown
   }
 
-  // Index types whose segments must all describe the same build configuration. Lance builds each
-  // segment independently and queries most of them independently too, so for those, segments built
-  // with different options differ in performance only. An inverted (FTS) index is the exception: its
-  // read path loads one set of index details for the whole logical index and rejects a set whose
-  // segments disagree, which fails every full-text query on the column. Kept explicit rather than
-  // inferred; extend it if core grows another type with the same requirement.
+  // FTS loads one config for all segments and rejects disagreement; other types query segments
+  // independently, so mismatched options only affect performance.
   private val uniformDetailsIndexTypes: Set[IndexType] = Set(IndexType.INVERTED)
 
   /** True when segments of this index type must all share one build configuration. */
   def requiresUniformSegmentDetails(indexType: IndexType): Boolean =
     indexType != null && uniformDetailsIndexTypes.contains(indexType)
 
-  /**
-   * Fails before commit when newly built segments describe a different build configuration than the
-   * segments they are about to join, for an index type that requires them to agree.
-   *
-   * Index details are the serialized build parameters, so this compares what was built rather than
-   * what was asked for, and it runs while the new segments are still uncommitted: a rejection leaves
-   * the index exactly as it was. Segments without index details predate the field, and an index
-   * being replaced wholesale has nothing to agree with; both cases defer to Lance core, which
-   * validates the segment set it is handed.
-   */
+  /** Pre-commit guard: rejects built segments whose configuration differs from retained ones. */
   def requireUniformSegmentDetails(
       indexType: IndexType,
       indexName: String,
@@ -807,12 +785,8 @@ object IndexUtils extends Logging {
       .toSet
 
   /**
-   * Segments of `indexName` that a segment commit will keep, resolved against `dataset` as it is now.
-   *
-   * Fails when the index is gone. A refresh resolves its target before the distributed build and
-   * commits after it, and `commitExistingIndexSegments` against a name Lance no longer knows creates
-   * that index rather than extending it: a DROP INDEX during the build would otherwise be undone,
-   * leaving the index back in place with only the coverage this build happened to plan for.
+   * Segments of `indexName` that the commit will keep. Fails if the index was dropped: committing
+   * against an unknown name creates a new index rather than extending the existing one.
    */
   def resolveRetainedSegments(
       dataset: Dataset,
@@ -972,18 +946,8 @@ object IndexUtils extends Logging {
    * Splits `fragments` into `numSegments` batches, each a contiguous run of fragment ids, chosen so
    * that the heaviest batch is as light as possible.
    *
-   * Contiguity is not cosmetic. Lance's compaction planner only groups fragments that are covered by
-   * the identical set of index segments, so batches whose fragment ids interleave leave every
-   * adjacent pair of fragments in a different group and make OPTIMIZE a no-op for the whole table.
-   * Since an index accumulates one segment set per build, and REFRESH INDEX adds more over time,
-   * interleaved coverage would permanently block compaction on exactly the append-heavy tables this
-   * command exists for. Balance is not sacrificed to get it: the optimal contiguous partition is
-   * found exactly, so a workload the previous least-loaded-first assignment balanced perfectly
-   * still is.
-   *
-   * Assignment is deterministic: the same fragments and segment count always produce the same
-   * batches, whatever order `fragments` arrives in. Every batch holds at least one fragment, so the
-   * result always has exactly `segmentCount` entries.
+   * Contiguity matters: Lance's compaction planner only groups fragments covered by the identical
+   * set of index segments, so interleaved batches make OPTIMIZE a no-op for the whole table.
    */
   def batchFragments(
       fragments: List[FragmentWorkload],
@@ -1025,14 +989,8 @@ object IndexUtils extends Logging {
   /**
    * Lengths of exactly `segmentCount` contiguous runs over `rowsUpTo`, minimising the heaviest run.
    *
-   * The smallest row budget a contiguous packing can respect is found by binary search, which is
-   * exact rather than approximate: for a fixed budget, extending each run as far as it will go uses
-   * the fewest runs, so the smallest feasible budget is the optimal maximum. The floor of the search
-   * is the widest single fragment, below which no packing exists.
-   *
-   * Packing at that budget can use fewer runs than were asked for, which would cost parallelism, so
-   * the remainder are split at their own balance points. A split only ever lowers the heaviest run,
-   * so optimality survives it.
+   * Binary-searches the smallest budget a contiguous packing can respect, then splits the heaviest
+   * runs until the count is reached.
    */
   private def balancedRunLengths(rowsUpTo: Array[Long], segmentCount: Int): Seq[Int] = {
     val fragmentCount = rowsUpTo.length - 1
@@ -1067,8 +1025,7 @@ object IndexUtils extends Logging {
     }
 
     if (runCount < segmentCount) {
-      // Heaviest splittable run first, so each extra batch is spent where it helps most. Ties break
-      // on length then on the earlier run, to keep the result independent of heap internals.
+      // Heaviest splittable run first. Ties break on length then position for determinism.
       val splittable = PriorityQueue.empty[(Long, Int, Int)](
         Ordering.by[(Long, Int, Int), (Long, Int, Int)] {
           case (rows, length, begin) => (rows, length, -begin)
