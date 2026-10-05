@@ -915,6 +915,39 @@ class TestDDLIndex:
         )
         assert spark.sql("SELECT * FROM default.test_table").count() == 4
 
+    def test_optimize_index(self, spark):
+        """Test incremental index maintenance through Spark SQL."""
+        spark.sql("CREATE TABLE default.test_table (id INT, name STRING)")
+        spark.sql("INSERT INTO default.test_table VALUES (1, 'one'), (2, 'two')")
+        spark.sql("""
+            ALTER TABLE default.test_table
+            CREATE INDEX idx_id USING zonemap (id)
+        """)
+        spark.sql("INSERT INTO default.test_table VALUES (3, 'three')")
+
+        before = next(
+            row
+            for row in spark.sql("SHOW INDEXES IN default.test_table").collect()
+            if row.name == "idx_id"
+        )
+        assert before.num_unindexed_fragments > 0
+
+        result = spark.sql("""
+            ALTER TABLE default.test_table OPTIMIZE INDEX idx_id
+            WITH (num_indices_to_merge = 0)
+        """).first()
+
+        assert result.index_name == "idx_id"
+        assert result.fragments_indexed == before.num_unindexed_fragments
+        assert result.segments_after >= result.segments_before
+
+        after = next(
+            row
+            for row in spark.sql("SHOW INDEXES IN default.test_table").collect()
+            if row.name == "idx_id"
+        )
+        assert after.num_unindexed_fragments == 0
+
     def test_create_btree_index_on_nested_literal_dot_field(self, spark):
         """Test CREATE INDEX on nested struct fields, including literal dots."""
         spark.sql("""
@@ -2269,6 +2302,175 @@ class TestDMLMerge:
 class TestDMLAddColumn:
     """Test DML ADD COLUMN FROM operations for schema evolution with backfill."""
 
+    def test_add_blob_v2_binary_column(self, spark):
+        """Test adding a BINARY column with blob v2 encoding."""
+        spark.sql("""
+            CREATE TABLE default.test_table (
+                id INT,
+                name STRING
+            )
+            TBLPROPERTIES (
+                'file_format_version' = '2.2'
+            )
+        """)
+
+        spark.sql("""
+            ALTER TABLE default.test_table
+            SET TBLPROPERTIES (
+                'content.lance.encoding' = 'blob',
+                'invalid_content.lance.encoding' = 'blob'
+            )
+        """)
+
+        first_content = b"alpha"
+        second_content = b"bravo-charlie"
+
+        spark.sql("""
+            INSERT INTO default.test_table VALUES
+            (1, 'alpha')
+        """)
+
+        spark.sql("""
+            INSERT INTO default.test_table VALUES
+            (2, 'bravo-charlie')
+        """)
+
+        spark.sql("""
+            CREATE TEMPORARY VIEW tmp_view AS
+            SELECT _rowaddr, _fragid, CAST(name AS BINARY) AS content
+            FROM default.test_table
+        """)
+
+        spark.sql("""
+            ALTER TABLE default.test_table ADD COLUMNS content FROM tmp_view
+        """)
+
+        content_field = next(
+            row
+            for row in spark.sql("DESCRIBE default.test_table").collect()
+            if row.col_name == "content"
+        )
+        content_type = content_field.data_type.lower()
+        assert "struct" in content_type
+        assert "kind" in content_type
+        assert "blob_uri" in content_type
+
+        rows = spark.sql("""
+            SELECT id, content.size, content.kind
+            FROM default.test_table
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.size, row.kind) for row in rows] == [
+            (1, len(first_content), 0),
+            (2, len(second_content), 0),
+        ]
+
+        spark.sql("""
+            CREATE OR REPLACE TEMPORARY VIEW tmp_view AS
+            SELECT _rowaddr, _fragid, name AS invalid_content
+            FROM default.test_table
+        """)
+
+        with pytest.raises(Exception, match="must have BINARY type"):
+            spark.sql("""
+                ALTER TABLE default.test_table
+                ADD COLUMNS invalid_content FROM tmp_view
+            """)
+
+        field_names = [field.name for field in spark.table("default.test_table").schema.fields]
+        assert "invalid_content" not in field_names
+
+    def test_add_blob_column_without_encoding_property_stays_binary(self, spark, test_table):
+        """Test that a blob column added without its encoding property stays BINARY."""
+        spark.sql(f"""
+            CREATE TABLE {test_table} (
+                id INT,
+                name STRING
+            )
+            TBLPROPERTIES (
+                'file_format_version' = '2.2'
+            )
+        """)
+
+        spark.sql(f"""
+            INSERT INTO {test_table} VALUES
+            (1, 'alpha'),
+            (2, 'bravo')
+        """)
+
+        spark.sql(f"""
+            CREATE TEMPORARY VIEW no_property_backfill AS
+            SELECT _rowaddr, _fragid, CAST(name AS BINARY) AS content
+            FROM {test_table}
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table} ADD COLUMNS content FROM no_property_backfill
+        """)
+
+        content_type = next(
+            row.data_type
+            for row in spark.sql(f"DESCRIBE {test_table}").collect()
+            if row.col_name == "content"
+        )
+        assert content_type == "binary"
+
+        spark.sql(f"""
+            ALTER TABLE {test_table}
+            SET TBLPROPERTIES ('content.lance.encoding' = 'blob')
+        """)
+
+        content_type_after_property = next(
+            row.data_type
+            for row in spark.sql(f"DESCRIBE {test_table}").collect()
+            if row.col_name == "content"
+        )
+        assert content_type_after_property == "binary"
+
+    def test_add_blob_column_with_mismatched_encoding_property_stays_binary(
+        self, spark, test_table
+    ):
+        """Test that an encoding property must exactly match the added column name."""
+        spark.sql(f"""
+            CREATE TABLE {test_table} (
+                id INT,
+                name STRING
+            )
+            TBLPROPERTIES (
+                'file_format_version' = '2.2'
+            )
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table}
+            SET TBLPROPERTIES ('content.lance.encoding' = 'blob')
+        """)
+
+        spark.sql(f"""
+            INSERT INTO {test_table} VALUES
+            (1, 'alpha'),
+            (2, 'bravo')
+        """)
+
+        spark.sql(f"""
+            CREATE TEMPORARY VIEW mismatched_property_backfill AS
+            SELECT _rowaddr, _fragid, CAST(name AS BINARY) AS content_bytes
+            FROM {test_table}
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table}
+            ADD COLUMNS content_bytes FROM mismatched_property_backfill
+        """)
+
+        content_bytes_type = next(
+            row.data_type
+            for row in spark.sql(f"DESCRIBE {test_table}").collect()
+            if row.col_name == "content_bytes"
+        )
+        assert content_bytes_type == "binary"
+
     def test_add_column_from_view(self, spark):
         """Test ALTER TABLE ADD COLUMNS FROM with single column."""
         spark.sql("""
@@ -2443,9 +2645,86 @@ class TestDMLAddColumn:
         assert result[1].total_compensation == 69000   # 60000 + 9000
         assert result[2].total_compensation == 84000   # 70000 + 14000
 
+    @pytest.mark.requires_rest
+    @pytest.mark.rest_dir_compatible
+    def test_add_column_from_view_on_rest(self, spark, test_table):
+        spark.sql(f"""
+            CREATE TABLE {test_table} (
+                id INT,
+                name STRING
+            )
+        """)
+
+        spark.sql(f"""
+            INSERT INTO {test_table} VALUES
+            (1, 'alpha'),
+            (2, 'bravo')
+        """)
+
+        spark.sql(f"""
+            CREATE OR REPLACE TEMPORARY VIEW namespace_add_columns_view AS
+            SELECT _rowaddr, _fragid, name AS name_copy
+            FROM {test_table}
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table} ADD COLUMNS name_copy FROM namespace_add_columns_view
+        """)
+
+        rows = spark.sql(f"""
+            SELECT id, name, name_copy
+            FROM {test_table}
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.name, row.name_copy) for row in rows] == [
+            (1, "alpha", "alpha"),
+            (2, "bravo", "bravo"),
+        ]
+
 
 class TestDMLUpdateColumn:
     """Test DML UPDATE COLUMNS FROM operations for updating existing columns via backfill."""
+
+    @pytest.mark.requires_rest
+    @pytest.mark.rest_dir_compatible
+    def test_update_column_from_view_on_rest(self, spark, test_table):
+        spark.sql(f"""
+            CREATE TABLE {test_table} (
+                id INT,
+                name STRING,
+                value INT
+            )
+        """)
+
+        spark.sql(f"""
+            INSERT INTO {test_table} VALUES
+            (1, 'alpha', 10),
+            (2, 'bravo', 20)
+        """)
+
+        spark.sql(f"""
+            CREATE OR REPLACE TEMPORARY VIEW namespace_update_columns_view AS
+            SELECT _rowaddr, _fragid, value * 10 AS value
+            FROM {test_table}
+            WHERE id = 2
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table}
+            UPDATE COLUMNS value FROM namespace_update_columns_view
+        """)
+
+        rows = spark.sql(f"""
+            SELECT id, name, value
+            FROM {test_table}
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.name, row.value) for row in rows] == [
+            (1, "alpha", 10),
+            (2, "bravo", 200),
+        ]
 
     def test_update_single_column(self, spark):
         """Test ALTER TABLE UPDATE COLUMNS FROM with a single column."""

@@ -214,7 +214,7 @@ copied this way; `ORDER BY` and `LIMIT` on the SELECT are supported. `writeTo().
 and `.overwrite()` work the same way. Transformed values (e.g. `content.size`),
 `DISTINCT`, `GROUP BY`, `UNION`, ordering by the blob column itself, and joins of multiple
 blob sources keep their descriptor semantics and cannot be inserted into a blob column. See
-[CREATE TABLE](../ddl/create-table.md#copying-blob-v2-columns-with-ctas) for creating a new
+[CREATE TABLE](../ddl/create-table.md#ctas-from-a-blob-v2-source) for creating a new
 table from a blob v2 query.
 
 On Spark 3.5+, `MERGE INTO` and `UPDATE` deep-copy blob v2 columns the same way: a blob
@@ -289,7 +289,7 @@ These options control how data is written to Lance datasets. They can be set usi
 | `max_rows_per_group`     | Integer | -        | Maximum number of rows per row group within a file.                                  |
 | `max_bytes_per_file`     | Long    | -        | Maximum size in bytes per Lance file.                                                |
 | `file_format_version`   | String  | -        | Lance file format version: `LEGACY` or `STABLE`.                                     |
-| `batch_size`             | Integer | `512`    | Number of rows per batch during writing.                                             |
+| `batch_size`             | Integer | `8192`   | Number of rows per batch during writing.                                             |
 | `use_queued_write_buffer`| Boolean | `false`  | Use pipelined write buffer for improved throughput.                                  |
 | `queue_depth`            | Integer | `8`      | Queue depth for pipelined writes (only used when `use_queued_write_buffer=true`).    |
 | `use_large_var_types`    | Boolean | `false`  | Use 64-bit offset vectors for all string/binary columns to avoid 2GB batch limit. See [Large Var Types](#large-var-types).   |

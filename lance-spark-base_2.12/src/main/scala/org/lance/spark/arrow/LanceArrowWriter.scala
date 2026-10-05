@@ -78,11 +78,19 @@ object LanceArrowWriter {
       resolver: BlobReferenceResolver = null): LanceArrowFieldWriter = {
     (sparkType, vector) match {
       case (ArrayType(elementType: NumericType, _), vector: FixedSizeListVector) =>
-        val elementWriter = createFieldWriter(vector.getDataVector(), elementType, null, resolver)
+        val elementWriter = createFieldWriter(
+          vector.getDataVector(),
+          elementType,
+          arrayElementMetadata(metadata),
+          resolver)
         new FixedSizeListWriter(vector, elementWriter)
 
       case (ArrayType(elementType, _), vector: ListVector) =>
-        val elementWriter = createFieldWriter(vector.getDataVector(), elementType, null, resolver)
+        val elementWriter = createFieldWriter(
+          vector.getDataVector(),
+          elementType,
+          arrayElementMetadata(metadata),
+          resolver)
         new ArrayWriter(vector, elementWriter)
 
       case (BooleanType, vector: BitVector) => new BooleanWriter(vector)
@@ -153,6 +161,14 @@ object LanceArrowWriter {
         createFieldWriter(vector, udt.sqlType, metadata, resolver)
       case (dt, _) =>
         throw new UnsupportedOperationException(s"Unsupported data type: $dt")
+    }
+  }
+
+  private def arrayElementMetadata(metadata: Metadata): Metadata = {
+    if (metadata == null || !metadata.contains(LanceArrowUtils.LANCE_ELEMENT_METADATA_KEY)) {
+      Metadata.empty
+    } else {
+      Metadata.fromJson(metadata.getString(LanceArrowUtils.LANCE_ELEMENT_METADATA_KEY))
     }
   }
 }
@@ -506,6 +522,11 @@ private[arrow] class BlobV2StructWriter(
   override def setNull(): Unit = ()
 
   override def setValue(input: SpecializedGetters, ordinal: Int): Unit = ()
+
+  // The data child buffers unresolved blob references, which resolve to far larger bytes on finish.
+  // Without delegating, the per-batch byte budget in the write buffer sees 0 for a blob v2 column
+  // and the batch grows until resolution materializes everything at once.
+  override def estimatedBufferedBytes: Long = dataWriter.estimatedBufferedBytes
 
   override def finish(): Unit = {
     super.finish()

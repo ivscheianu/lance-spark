@@ -15,14 +15,16 @@ package org.lance.spark.read;
 
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.FragmentStatistics;
 import org.lance.ManifestSummary;
+import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.lance.index.IndexType;
 import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.memwal.ShardingField;
 import org.lance.memwal.ShardingSpec;
-import org.lance.schema.LanceField;
 import org.lance.schema.LanceSchema;
 import org.lance.spark.LanceConstant;
 import org.lance.spark.LanceRef;
@@ -32,6 +34,7 @@ import org.lance.spark.search.LanceSearchQuery;
 import org.lance.spark.search.LanceSearchScan;
 import org.lance.spark.sharding.SparkLanceShardingUtils;
 import org.lance.spark.utils.BlobUtils;
+import org.lance.spark.utils.FieldPathUtils;
 import org.lance.spark.utils.FullTextQueryUtils;
 import org.lance.spark.utils.Optional;
 import org.lance.spark.utils.Utils;
@@ -62,6 +65,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -99,6 +103,7 @@ public class LanceScanBuilder
   private Optional<List<ColumnOrdering>> topNSortOrders = Optional.empty();
   private Optional<Aggregation> pushedAggregation = Optional.empty();
   private LanceLocalScan localScan = null;
+  private LanceIndexedCountScan indexedCountScan = null;
 
   // Lazily opened dataset for reuse during scan building
   private Dataset lazyDataset = null;
@@ -171,6 +176,9 @@ public class LanceScanBuilder
       if (localScan != null) {
         return localScan;
       }
+      if (indexedCountScan != null) {
+        return indexedCountScan;
+      }
 
       // Reject _score without an active FTS query. The metadata column is advertised
       // unconditionally (analyzer resolves it before the FTS rule runs), so validation
@@ -203,13 +211,23 @@ public class LanceScanBuilder
           SparkLanceShardingUtils.isEmpty(shardingSpec)
               ? SparkLanceShardingUtils.firstShardingSpec(dataset)
               : shardingSpec;
+
+      // Pre-compute splits and per-fragment row counts from the same Dataset handle that we
+      // already opened above. This provides the live fragment IDs needed for safe sharding
+      // detection and pins the resolved version onto the read options shipped to workers, so the
+      // zonemap stats and splits come from the same snapshot. The version is kept as a long
+      // end-to-end so long-lived high-write-frequency datasets do not silently truncate it.
+      LanceSplit.ScanPlanResult scanPlan = LanceSplit.planScan(dataset, readOptions);
+      Set<Integer> liveFragmentIds = new HashSet<>(scanPlan.getFragmentRowCounts().keySet());
+
       for (ShardingField field : SparkLanceShardingUtils.fields(activeShardingSpec)) {
         columnsToLoad.add(SparkLanceShardingUtils.columnName(field, lanceSchema));
       }
 
-      // Load zonemap stats for all requested columns in one pass.
-      Map<String, List<ZoneStats>> zonemapStats =
-          loadZonemapStats(getOrOpenDataset(), columnsToLoad);
+      // Load zonemap stats for all requested columns in one pass, along with each
+      // column's index coverage.
+      ZonemapLoadResult zonemapLoad = loadZonemapStats(getOrOpenDataset(), columnsToLoad);
+      Map<String, List<ZoneStats>> zonemapStats = zonemapLoad.stats;
 
       // Detect sharding-compatible fragments from zonemap stats. Each field checks its column's
       // zones; if every fragment has a single sharding value, we get a fragment-to-key map.
@@ -227,7 +245,8 @@ public class LanceScanBuilder
           continue;
         }
         java.util.Optional<Map<Integer, Object>> keys =
-            SparkLanceShardingUtils.detectFragmentKeys(field, lanceSchema, colStats);
+            SparkLanceShardingUtils.detectFragmentKeys(
+                field, lanceSchema, colStats, liveFragmentIds);
         if (keys.isPresent()) {
           fragmentShardingKeys = keys.get();
           activeShardingExpression = SparkLanceShardingUtils.toSparkExpression(field, lanceSchema);
@@ -246,18 +265,27 @@ public class LanceScanBuilder
       Set<Integer> survivingFragmentIds = null;
       if (pushedPredicates.length > 0 && !zonemapStats.isEmpty()) {
         survivingFragmentIds =
-            ZonemapFragmentPruner.pruneFragments(pushedPredicates, zonemapStats).orElse(null);
+            ZonemapFragmentPruner.pruneFragments(
+                    pushedPredicates, zonemapStats, zonemapLoad.uncoveredByColumn)
+                .orElse(null);
       }
 
-      // Scale rows and full size by the zonemap fragment-pruning ratio first, then let
+      // Scale rows and full size by the surviving-row ratio first, then let
       // LanceStatistics.estimateProjected apply the column-width ratio on top
       // (when the projected schema is narrower than the full schema).
       long projectedRows = summary.getTotalRows();
       long projectedFullSize = summary.getTotalFilesSize();
-      if (survivingFragmentIds != null && summary.getTotalFragments() > 0) {
-        double ratio = (double) survivingFragmentIds.size() / summary.getTotalFragments();
-        projectedRows = (long) (projectedRows * ratio);
-        projectedFullSize = (long) (projectedFullSize * ratio);
+      if (survivingFragmentIds != null && !scanPlan.getFragmentRowCounts().isEmpty()) {
+        long survivingRows =
+            survivingFragmentIds.stream()
+                .mapToLong(
+                    fragmentId -> scanPlan.getFragmentRowCounts().getOrDefault(fragmentId, 0L))
+                .sum();
+        LanceStatistics postPruning =
+            LanceStatistics.estimatePostPruningByRows(
+                summary.getTotalRows(), summary.getTotalFilesSize(), survivingRows);
+        projectedRows = postPruning.numRows().getAsLong();
+        projectedFullSize = postPruning.sizeInBytes().getAsLong();
       }
       LanceStatistics statistics =
           LanceStatistics.estimateProjected(projectedRows, projectedFullSize, fullSchema, schema);
@@ -273,14 +301,7 @@ public class LanceScanBuilder
             summary.getTotalRows());
       }
 
-      // Pre-compute splits and per-fragment row counts from the same Dataset handle that we
-      // already opened above. This consolidates two driver-side opens into one and lets us pin
-      // the resolved version onto the read options shipped to workers, providing snapshot
-      // isolation across all tasks of this query. The version is kept as a long end-to-end so
-      // long-lived high-write-frequency datasets do not silently truncate to a wrong version.
-      LanceSplit.ScanPlanResult scanPlan = LanceSplit.planScan(dataset, readOptions);
       LanceSparkReadOptions resolvedReadOptions = readOptions.withRef(scanPlan.getRef());
-
       Optional<String> whereCondition =
           FilterPushDown.compileFiltersToSqlWhereClause(pushedPredicates);
       return new LanceScan(
@@ -293,7 +314,6 @@ public class LanceScanBuilder
           pushedAggregation,
           pushedPredicates,
           statistics,
-          zonemapStats,
           survivingFragmentIds,
           scanPlan.getSplits(),
           scanPlan.getFragmentRowCounts(),
@@ -304,6 +324,198 @@ public class LanceScanBuilder
           namespaceProperties);
     } finally {
       closeLazyDataset();
+    }
+  }
+
+  private static ExactLookupColumn exactLookupColumn(
+      LanceSchema lanceSchema, Predicate[] predicates) {
+    if (predicates.length == 0) {
+      return null;
+    }
+
+    Integer fieldId = null;
+    String columnPath = null;
+    boolean hasLookup = false;
+    for (Predicate predicate : predicates) {
+      // IS_NOT_NULL may accompany an exact lookup but is not an exact lookup by itself.
+      if ("=".equals(predicate.name()) || "IN".equals(predicate.name())) {
+        hasLookup = true;
+      } else if (!"IS_NOT_NULL".equals(predicate.name())) {
+        return null;
+      }
+
+      NamedReference[] references = predicate.references();
+      if (references.length != 1) {
+        return null;
+      }
+      String path = FieldPathUtils.canonicalPath(Arrays.asList(references[0].fieldNames()));
+      int predicateFieldId;
+      try {
+        predicateFieldId = FieldPathUtils.resolveLeafField(lanceSchema, path).getId();
+      } catch (IllegalArgumentException e) {
+        return null;
+      }
+      if (fieldId != null && fieldId != predicateFieldId) {
+        return null;
+      }
+      fieldId = predicateFieldId;
+      columnPath = String.join(".", references[0].fieldNames());
+    }
+    return hasLookup ? new ExactLookupColumn(fieldId, columnPath) : null;
+  }
+
+  static Optional<String> compileExactLookupCountFilter(Predicate[] predicates) {
+    List<Predicate> lookupPredicates = new ArrayList<>(predicates.length);
+    for (Predicate predicate : predicates) {
+      if (!"IS_NOT_NULL".equals(predicate.name())) {
+        lookupPredicates.add(predicate);
+      }
+    }
+    return FilterPushDown.compileFiltersToSqlWhereClause(
+        lookupPredicates.toArray(new Predicate[0]));
+  }
+
+  private ExactLookupCount findFullyCoveringExactLookupIndex(Dataset dataset) {
+    if (!readOptions.isUseScalarIndex()
+        || readOptions.getFullTextQuery() != null
+        || pushedPredicates.length == 0) {
+      return ExactLookupCount.miss();
+    }
+
+    ExactLookupColumn column = exactLookupColumn(dataset.getLanceSchema(), pushedPredicates);
+    if (column == null) {
+      return ExactLookupCount.miss();
+    }
+
+    // Avoid exporting unrelated indexes, including vector indexes, as full segment metadata.
+    IndexCriteria criteria =
+        new IndexCriteria.Builder()
+            .forColumn(column.columnPath)
+            .mustSupportExactEquality(true)
+            .build();
+    Map<String, List<Index>> candidateSegments = new HashMap<>();
+    for (IndexDescription description : dataset.describeIndices(criteria)) {
+      List<Index> segments = scalarLookupSegments(description, column.fieldId);
+      if (segments != null) {
+        candidateSegments.put(description.getName(), segments);
+      }
+    }
+    if (candidateSegments.isEmpty()) {
+      return ExactLookupCount.miss();
+    }
+
+    FragmentStatistics fragmentStatistics = dataset.getFragmentStatistics();
+    Set<Integer> nonemptyFragmentIds = nonemptyFragmentIds(fragmentStatistics);
+    if (nonemptyFragmentIds == null) {
+      return ExactLookupCount.empty();
+    }
+
+    String selectedName = null;
+    int selectedSegments = Integer.MAX_VALUE;
+    for (Map.Entry<String, List<Index>> candidate : candidateSegments.entrySet()) {
+      Set<Integer> coveredFragments = new HashSet<>();
+      boolean hasCompleteCoverageMetadata = true;
+      for (Index segment : candidate.getValue()) {
+        if (!segment.fragments().isPresent()) {
+          hasCompleteCoverageMetadata = false;
+          break;
+        }
+        coveredFragments.addAll(segment.fragments().get());
+      }
+      if (!hasCompleteCoverageMetadata || !coveredFragments.containsAll(nonemptyFragmentIds)) {
+        continue;
+      }
+      int segments = candidate.getValue().size();
+      String name = candidate.getKey();
+      if (selectedName == null
+          || segments < selectedSegments
+          || (segments == selectedSegments && name.compareTo(selectedName) < 0)) {
+        selectedName = name;
+        selectedSegments = segments;
+      }
+    }
+    if (selectedName == null) {
+      return ExactLookupCount.miss();
+    }
+    LOG.debug(
+        "Using fully covering index '{}' for filtered COUNT(*)"
+            + " ({} segments, {} fragments; fewest segments, then name)",
+        selectedName,
+        selectedSegments,
+        nonemptyFragmentIds.size());
+    return ExactLookupCount.index(selectedName);
+  }
+
+  private static List<Index> scalarLookupSegments(IndexDescription description, int fieldId) {
+    List<Index> segments = description.getSegments();
+    if (segments == null || segments.isEmpty()) {
+      return null;
+    }
+    for (Index segment : segments) {
+      List<Integer> fields = segment.fields();
+      if ((segment.indexType() != IndexType.BTREE && segment.indexType() != IndexType.BITMAP)
+          || fields == null
+          || fields.size() != 1
+          || !fields.get(0).equals(fieldId)) {
+        return null;
+      }
+    }
+    return segments;
+  }
+
+  // Returns null for no fragments or when every aligned row count is zero. Missing or unaligned
+  // row counts conservatively retain every fragment id.
+  private static Set<Integer> nonemptyFragmentIds(FragmentStatistics fragmentStatistics) {
+    int[] fragmentIds = fragmentStatistics.getIds();
+    if (fragmentIds.length == 0) {
+      return null;
+    }
+    long[] rowCounts = fragmentStatistics.getRowCounts();
+    boolean rowCountsAligned = rowCounts != null && rowCounts.length == fragmentIds.length;
+    Set<Integer> nonempty = new HashSet<>();
+    for (int i = 0; i < fragmentIds.length; i++) {
+      if (!rowCountsAligned || rowCounts[i] > 0) {
+        nonempty.add(fragmentIds[i]);
+      }
+    }
+    return nonempty.isEmpty() ? null : nonempty;
+  }
+
+  private static final class ExactLookupCount {
+    enum Kind {
+      MISS,
+      EMPTY,
+      INDEX
+    }
+
+    final Kind kind;
+    final String indexName;
+
+    private ExactLookupCount(Kind kind, String indexName) {
+      this.kind = kind;
+      this.indexName = indexName;
+    }
+
+    static ExactLookupCount miss() {
+      return new ExactLookupCount(Kind.MISS, null);
+    }
+
+    static ExactLookupCount empty() {
+      return new ExactLookupCount(Kind.EMPTY, null);
+    }
+
+    static ExactLookupCount index(String indexName) {
+      return new ExactLookupCount(Kind.INDEX, indexName);
+    }
+  }
+
+  private static final class ExactLookupColumn {
+    final int fieldId;
+    final String columnPath;
+
+    private ExactLookupColumn(int fieldId, String columnPath) {
+      this.fieldId = fieldId;
+      this.columnPath = columnPath;
     }
   }
 
@@ -452,7 +664,13 @@ public class LanceScanBuilder
       FieldReference reference = (FieldReference) sortOrder.expression();
       String columnName = reference.fieldNames()[0];
       if (columnName.equals(LanceConstant.SCORE)) {
-        return false;
+        if (orders.length != 1
+            || sortOrder.direction() != SortDirection.DESCENDING
+            || !shouldNamespaceFtsScan()) {
+          return false;
+        }
+        this.limit = Optional.of(limit);
+        return true;
       }
       builder.setColumnName(columnName);
       topNSortOrders.add(builder.build());
@@ -472,19 +690,65 @@ public class LanceScanBuilder
       return false;
     }
     if (funcs.length == 1 && funcs[0] instanceof CountStar) {
-      // Check if we can use metadata-based count (no filters pushed)
-      if (pushedPredicates.length == 0) {
-        Optional<Long> metadataCount = getCountFromMetadata(getOrOpenDataset());
+      // Metadata-based count is only valid when nothing restricts the rows. A full-text query is
+      // carried in the read options rather than as a pushed predicate, because the FTS rule moves
+      // the predicate out of the Filter and into the relation options, so it must be checked
+      // separately or COUNT(*) would answer from the manifest and ignore the FTS query.
+      Dataset dataset = getOrOpenDataset();
+      if (pushedPredicates.length == 0 && readOptions.getFullTextQuery() == null) {
+        Optional<Long> metadataCount = getCountFromMetadata(dataset);
         if (metadataCount.isPresent()) {
-          // Create LocalScan with pre-computed count result
-          StructType countSchema = new StructType().add("count", DataTypes.LongType);
-          InternalRow[] rows = new InternalRow[1];
-          rows[0] = new GenericInternalRow(new Object[] {metadataCount.get()});
-          this.localScan = new LanceLocalScan(countSchema, rows, readOptions.getDatasetUri());
+          setLocalCount(metadataCount.get());
           return true;
         }
       }
-      // Fall back to scan-based count (with filters or metadata unavailable)
+
+      // total_rows omits fragments with unknown deletion counts, so only total_fragments can prove
+      // that the dataset has no fragments.
+      if (hasNoFragments(dataset)) {
+        setLocalCount(0L);
+        return true;
+      }
+
+      ExactLookupCount lookup;
+      try {
+        lookup = findFullyCoveringExactLookupIndex(dataset);
+      } catch (RuntimeException e) {
+        LOG.warn(
+            "Failed to inspect scalar indexes for filtered COUNT(*);"
+                + " falling back to a distributed scan: {}",
+            e.getMessage());
+        lookup = ExactLookupCount.miss();
+      }
+      if (lookup.kind == ExactLookupCount.Kind.EMPTY) {
+        setLocalCount(0L);
+        return true;
+      }
+      if (lookup.kind == ExactLookupCount.Kind.INDEX) {
+        Optional<String> filter = compileExactLookupCountFilter(pushedPredicates);
+        if (filter.isPresent()) {
+          try {
+            LanceSparkReadOptions pinned =
+                readOptions.withRef(Utils.pinOpenedRef(dataset, readOptions.getRef()));
+            this.indexedCountScan =
+                new LanceIndexedCountScan(
+                    pinned,
+                    lookup.indexName,
+                    filter.get(),
+                    initialStorageOptions,
+                    namespaceImpl,
+                    namespaceProperties);
+            return true;
+          } catch (RuntimeException e) {
+            LOG.warn(
+                "Failed to plan an indexed COUNT(*) with scalar index '{}';"
+                    + " falling back to a distributed scan: {}",
+                lookup.indexName,
+                e.getMessage());
+          }
+        }
+      }
+      // Fall back to scan-based count (with filters, a full-text query, or metadata unavailable)
       this.pushedAggregation = Optional.of(aggregation);
       return true;
     }
@@ -501,6 +765,13 @@ public class LanceScanBuilder
     return false;
   }
 
+  private void setLocalCount(long count) {
+    StructType countSchema = new StructType().add("count", DataTypes.LongType);
+    InternalRow[] rows = new InternalRow[1];
+    rows[0] = new GenericInternalRow(new Object[] {count});
+    this.localScan = new LanceLocalScan(countSchema, rows, readOptions.getDatasetUri());
+  }
+
   private static Optional<Long> getCountFromMetadata(Dataset dataset) {
     try {
       ManifestSummary summary = dataset.getVersion().getManifestSummary();
@@ -510,66 +781,85 @@ public class LanceScanBuilder
     }
   }
 
-  /**
-   * Loads zonemap statistics for the requested columns. Only loads stats for columns that have a
-   * zonemap index.
-   */
-  private Map<String, List<ZoneStats>> loadZonemapStats(Dataset dataset, Set<String> columns) {
-    if (columns.isEmpty()) {
-      return Collections.emptyMap();
+  private static boolean hasNoFragments(Dataset dataset) {
+    try {
+      return dataset.getVersion().getManifestSummary().getTotalFragments() == 0L;
+    } catch (Exception e) {
+      return false;
     }
+  }
 
-    Set<String> zonemapColumns = findZonemapIndexedColumns(dataset);
-    LOG.debug("zonemapColumns={}, requested columns={}", zonemapColumns, columns);
-
+  /** Loads zone stats for every requested column, without consulting index coverage. */
+  private Map<String, List<ZoneStats>> loadStatsForColumns(Dataset dataset, Set<String> columns) {
     Map<String, List<ZoneStats>> result = new HashMap<>();
     for (String col : columns) {
-      if (zonemapColumns.isEmpty() || zonemapColumns.contains(col)) {
-        try {
-          List<ZoneStats> stats = dataset.getZonemapStats(col);
-          LOG.debug("getZonemapStats('{}') returned {} zones", col, stats.size());
-          if (!stats.isEmpty()) {
-            result.put(col, stats);
-            LOG.debug("Loaded {} zonemap zones for column '{}'", stats.size(), col);
-          }
-        } catch (Exception e) {
-          LOG.debug("Failed to load zonemap stats for column" + " '{}': {}", col, e.getMessage());
+      try {
+        List<ZoneStats> stats = dataset.getZonemapStats(col);
+        if (!stats.isEmpty()) {
+          result.put(col, stats);
         }
+      } catch (Exception e) {
+        LOG.debug("Failed to load zonemap stats for column '{}': {}", col, e.getMessage());
       }
     }
-
-    if (!result.isEmpty()) {
-      LOG.debug("Loaded zonemap stats for {} columns: {}", result.size(), result.keySet());
-    }
-
     return result;
   }
 
-  private Set<String> findZonemapIndexedColumns(Dataset dataset) {
-    Set<String> columns = new HashSet<>();
-    try {
-      Map<Integer, String> fieldIdToName = new HashMap<>();
-      for (LanceField field : dataset.getLanceSchema().fields()) {
-        fieldIdToName.put(field.getId(), field.getName());
-      }
+  /** Zone stats plus, per column, the dataset fragments those stats do not describe. */
+  private static final class ZonemapLoadResult {
+    final Map<String, List<ZoneStats>> stats;
+    final Map<String, Set<Integer>> uncoveredByColumn;
 
-      IndexCriteria criteria = new IndexCriteria.Builder().build();
-      for (IndexDescription idx : dataset.describeIndices(criteria)) {
-        LOG.debug(
-            "Index '{}' type='{}' fields={}", idx.getName(), idx.getIndexType(), idx.getFieldIds());
-        if ("ZONEMAP".equalsIgnoreCase(idx.getIndexType())) {
-          for (int fieldId : idx.getFieldIds()) {
-            String name = fieldIdToName.get(fieldId);
-            if (name != null) {
-              columns.add(name);
-            }
-          }
-        }
-      }
-    } catch (Exception e) {
-      LOG.warn("Failed to query zonemap indexes: {}", e.getMessage());
+    ZonemapLoadResult(Map<String, List<ZoneStats>> stats, Map<String, Set<Integer>> uncovered) {
+      this.stats = stats;
+      this.uncoveredByColumn = uncovered;
     }
-    return columns;
+  }
+
+  /**
+   * Loads zone stats for the requested columns, plus the fragments each column's zones do not
+   * describe.
+   *
+   * <p>Coverage comes from the zones themselves: a column can carry several zonemap indexes and
+   * {@code getZonemapStats} returns the zones of only one, so index metadata would claim coverage
+   * for fragments those zones never saw.
+   */
+  private ZonemapLoadResult loadZonemapStats(Dataset dataset, Set<String> columns) {
+    if (columns.isEmpty()) {
+      return new ZonemapLoadResult(Collections.emptyMap(), Collections.emptyMap());
+    }
+
+    Map<String, List<ZoneStats>> stats = loadStatsForColumns(dataset, columns);
+    if (stats.isEmpty()) {
+      return new ZonemapLoadResult(stats, Collections.emptyMap());
+    }
+
+    Set<Integer> allFragments = new HashSet<>();
+    for (Fragment fragment : dataset.getFragments()) {
+      allFragments.add(fragment.getId());
+    }
+
+    Map<String, Set<Integer>> uncoveredByColumn = new HashMap<>();
+    for (Map.Entry<String, List<ZoneStats>> entry : stats.entrySet()) {
+      Set<Integer> described = new HashSet<>();
+      for (ZoneStats zone : entry.getValue()) {
+        described.add(zone.getFragmentId());
+      }
+      Set<Integer> uncovered = new HashSet<>(allFragments);
+      uncovered.removeAll(described);
+      uncoveredByColumn.put(entry.getKey(), uncovered);
+      if (!uncovered.isEmpty()) {
+        LOG.info(
+            "Zonemap zones for '{}' describe {} of {} fragments;"
+                + " retaining {} unindexed fragment(s) in the scan",
+            entry.getKey(),
+            allFragments.size() - uncovered.size(),
+            allFragments.size(),
+            uncovered.size());
+      }
+    }
+
+    return new ZonemapLoadResult(stats, uncoveredByColumn);
   }
 
   private static Set<String> extractReferencedColumns(Predicate[] predicates) {

@@ -14,10 +14,14 @@
 package org.lance.spark.read;
 
 import org.lance.ipc.FullTextQuery;
+import org.lance.spark.LanceConstant;
 import org.lance.spark.LanceRef;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.TestUtils;
+import org.lance.spark.search.LanceSearchInputPartition;
+import org.lance.spark.search.LanceSearchScan;
 import org.lance.spark.utils.BlobUtils;
+import org.lance.spark.utils.Optional;
 
 import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.FieldReference;
@@ -229,6 +233,50 @@ public class LanceScanBuilderTest {
   }
 
   @Test
+  public void testPushTopNForScoreOnlySupportsNamespaceDescendingOrder() {
+    int k = 10;
+    SortOrder scoreDescending =
+        new TestSortOrder(LanceConstant.SCORE, SortDirection.DESCENDING, NullOrdering.NULLS_LAST);
+    LanceScanBuilder namespaceBuilder = createFtsScoreBuilder("dir");
+    assertTrue(namespaceBuilder.pushTopN(new SortOrder[] {scoreDescending}, k));
+    assertEquals(k, getNamespaceFtsTopK(namespaceBuilder));
+
+    SortOrder scoreAscending =
+        new TestSortOrder(LanceConstant.SCORE, SortDirection.ASCENDING, NullOrdering.NULLS_FIRST);
+    LanceScanBuilder ascendingBuilder = createFtsScoreBuilder("dir");
+    assertFalse(ascendingBuilder.pushTopN(new SortOrder[] {scoreAscending}, k));
+    assertEquals(Integer.MAX_VALUE, getNamespaceFtsTopK(ascendingBuilder));
+
+    SortOrder otherColumnAscending =
+        new TestSortOrder("x", SortDirection.ASCENDING, NullOrdering.NULLS_FIRST);
+    LanceScanBuilder multiColumnBuilder = createFtsScoreBuilder("dir");
+    assertFalse(
+        multiColumnBuilder.pushTopN(new SortOrder[] {scoreDescending, otherColumnAscending}, k));
+    assertEquals(Integer.MAX_VALUE, getNamespaceFtsTopK(multiColumnBuilder));
+
+    LanceScanBuilder localBuilder = createFtsScoreBuilder(null);
+    assertFalse(localBuilder.pushTopN(new SortOrder[] {scoreDescending}, k));
+  }
+
+  private LanceScanBuilder createFtsScoreBuilder(String namespaceImpl) {
+    LanceSparkReadOptions options =
+        LanceSparkReadOptions.builder()
+            .datasetUri(TestUtils.TestTable1Config.datasetUri)
+            .tableId(Collections.singletonList("default"))
+            .fullTextQuery(FullTextQuery.match("hello", "body"))
+            .build();
+    StructType scoreSchema = new StructType().add(LanceConstant.SCORE, DataTypes.FloatType);
+    return new LanceScanBuilder(
+        scoreSchema, options, Collections.emptyMap(), namespaceImpl, Collections.emptyMap());
+  }
+
+  private int getNamespaceFtsTopK(LanceScanBuilder builder) {
+    LanceSearchScan scan = (LanceSearchScan) builder.build();
+    LanceSearchInputPartition partition = (LanceSearchInputPartition) scan.planInputPartitions()[0];
+    return partition.getQuery().toQueryTableRequest().getK();
+  }
+
+  @Test
   public void testPushTopNDisabledByConfig() {
     LanceSparkReadOptions options =
         LanceSparkReadOptions.from(
@@ -282,6 +330,19 @@ public class LanceScanBuilderTest {
     Aggregation countStar =
         new Aggregation(new AggregateFunc[] {new CountStar()}, new Expression[] {});
     assertTrue(builder.pushAggregation(countStar));
+  }
+
+  @Test
+  public void testExactLookupCountFilterDropsRedundantNotNull() {
+    Predicate[] equality =
+        new Predicate[] {TestPredicates.isNotNull("category"), TestPredicates.eq("category", 5)};
+    Optional<String> equalityFilter = LanceScanBuilder.compileExactLookupCountFilter(equality);
+    assertEquals(Optional.of("(category == 5)"), equalityFilter);
+
+    Predicate[] inList =
+        new Predicate[] {TestPredicates.isNotNull("category"), TestPredicates.in("category", 1, 2)};
+    Optional<String> inFilter = LanceScanBuilder.compileExactLookupCountFilter(inList);
+    assertEquals(Optional.of("(category IN (1,2))"), inFilter);
   }
 
   @Test
@@ -395,6 +456,31 @@ public class LanceScanBuilderTest {
     // Metadata-based COUNT(*) without filters returns LanceLocalScan
     assertNotNull(scan);
     assertInstanceOf(LanceLocalScan.class, scan);
+  }
+
+  /**
+   * A full-text query restricts rows but is carried in the read options rather than as a pushed
+   * predicate, so the metadata-based COUNT(*) shortcut must not fire: answering from {@code
+   * ManifestSummary.getTotalRows()} would ignore the FTS query and return the whole table's count.
+   */
+  @Test
+  public void testBuildWithCountStarAndFullTextQueryReturnsLanceScan() {
+    LanceSparkReadOptions ftsOptions =
+        LanceSparkReadOptions.builder()
+            .datasetUri(TestUtils.TestTable1Config.readOptions.getDatasetUri())
+            .fullTextQuery(FullTextQuery.match("hello", "name"))
+            .build();
+    LanceScanBuilder builder =
+        new LanceScanBuilder(
+            TEST_SCHEMA, ftsOptions, Collections.emptyMap(), null, Collections.emptyMap());
+    Aggregation countStar =
+        new Aggregation(new AggregateFunc[] {new CountStar()}, new Expression[] {});
+    assertTrue(builder.pushAggregation(countStar), "COUNT(*) must still be pushed down");
+    Scan scan = builder.build();
+    assertInstanceOf(
+        LanceScan.class,
+        scan,
+        "COUNT(*) with an active full-text query must be answered by a scan, not LanceLocalScan");
   }
 
   /** Minimal SortOrder implementation for testing pushTopN. */

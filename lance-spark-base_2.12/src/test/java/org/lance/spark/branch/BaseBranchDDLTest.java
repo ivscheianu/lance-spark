@@ -591,6 +591,23 @@ public abstract class BaseBranchDDLTest {
   }
 
   @Test
+  public void testVersionOptionPinsTheScanToThatVersion() {
+    DatasetVersions versions = prepareDatasetWithHistory();
+    Assertions.assertNotEquals(versions.firstInsertVersion, versions.latestVersion);
+
+    Assertions.assertEquals(
+        5,
+        spark
+            .read()
+            .option("version", Long.toString(versions.firstInsertVersion))
+            .table(fullTable)
+            .count(),
+        "reading with the version option must see only the rows present at that version");
+    Assertions.assertEquals(
+        10, spark.table(fullTable).count(), "the unpinned read still sees the latest version");
+  }
+
+  @Test
   public void testBranchIdentifierRejectsVersionAsOf() {
     DatasetVersions versions = prepareDatasetWithHistory();
     spark.sql(
@@ -665,7 +682,7 @@ public abstract class BaseBranchDDLTest {
   }
 
   @Test
-  public void testBranchIdentifierRejectsCreateIndexAndVacuum() throws Exception {
+  public void testBranchIdentifierRejectsIndexMaintenanceAndVacuum() throws Exception {
     prepareDatasetWithHistory();
     spark.sql(String.format("alter table %s create branch audit", fullTable));
 
@@ -693,6 +710,16 @@ public abstract class BaseBranchDDLTest {
                             + "with (train=false)")
                     .collectAsList());
     Assertions.assertTrue(exceptionChainMessages(createIndex).contains("Writes are not supported"));
+
+    Exception optimizeIndex =
+        Assertions.assertThrows(
+            Exception.class,
+            () ->
+                spark
+                    .sql("alter table " + fullTable + ".branch_audit optimize index id_idx")
+                    .collectAsList());
+    Assertions.assertTrue(
+        exceptionChainMessages(optimizeIndex).contains("Writes are not supported"));
 
     Exception vacuum =
         Assertions.assertThrows(

@@ -19,6 +19,7 @@ import org.lance.Fragment;
 import org.lance.FragmentMetadata;
 import org.lance.Transaction;
 import org.lance.fragment.FragmentMergeResult;
+import org.lance.namespace.LanceNamespace;
 import org.lance.operation.Merge;
 import org.lance.spark.LanceDataset;
 import org.lance.spark.LanceRef;
@@ -65,6 +66,7 @@ public class AddColumnsBackfillBatchWrite implements BatchWrite {
 
   private final Map<String, String> namespaceProperties;
   private final List<String> tableId;
+  private final boolean managedVersioning;
 
   public AddColumnsBackfillBatchWrite(
       StructType schema,
@@ -73,7 +75,8 @@ public class AddColumnsBackfillBatchWrite implements BatchWrite {
       Map<String, String> initialStorageOptions,
       String namespaceImpl,
       Map<String, String> namespaceProperties,
-      List<String> tableId) {
+      List<String> tableId,
+      boolean managedVersioning) {
     this.schema = schema;
     try (Dataset ds = Utils.openDatasetBuilder(writeOptions).build()) {
       this.writeOptions = writeOptions.withRef(LanceRef.ofMain(ds.version()));
@@ -84,6 +87,7 @@ public class AddColumnsBackfillBatchWrite implements BatchWrite {
     this.namespaceImpl = namespaceImpl;
     this.namespaceProperties = namespaceProperties;
     this.tableId = tableId;
+    this.managedVersioning = managedVersioning;
   }
 
   @Override
@@ -160,6 +164,14 @@ public class AddColumnsBackfillBatchWrite implements BatchWrite {
       String fileFormatVersion = writeOptions.getFileFormatVersion();
       if (fileFormatVersion != null) {
         commitBuilder.storageFormat(fileFormatVersion);
+      }
+      if (managedVersioning) {
+        LanceNamespace namespace =
+            LanceRuntime.getOrCreateNamespace(namespaceImpl, namespaceProperties);
+        commitBuilder
+            .namespaceClient(namespace)
+            .tableId(tableId)
+            .namespaceClientManagedVersioning(true);
       }
       try (Transaction txn =
               new Transaction.Builder().readVersion(version).operation(merge).build();
