@@ -23,6 +23,7 @@ import org.lance.spark.search.LanceSearchScan;
 import org.lance.spark.utils.BlobUtils;
 import org.lance.spark.utils.Optional;
 
+import org.apache.spark.sql.catalyst.expressions.MetadataAttribute;
 import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.FieldReference;
 import org.apache.spark.sql.connector.expressions.NullOrdering;
@@ -249,6 +250,9 @@ public class LanceScanBuilderTest {
 
     SortOrder otherColumnAscending =
         new TestSortOrder("x", SortDirection.ASCENDING, NullOrdering.NULLS_FIRST);
+    LanceScanBuilder otherColumnBuilder = createFtsScoreBuilder("dir");
+    assertFalse(otherColumnBuilder.pushTopN(new SortOrder[] {otherColumnAscending}, k));
+    assertEquals(Integer.MAX_VALUE, getNamespaceFtsTopK(otherColumnBuilder));
     LanceScanBuilder multiColumnBuilder = createFtsScoreBuilder("dir");
     assertFalse(
         multiColumnBuilder.pushTopN(new SortOrder[] {scoreDescending, otherColumnAscending}, k));
@@ -265,7 +269,13 @@ public class LanceScanBuilderTest {
             .tableId(Collections.singletonList("default"))
             .fullTextQuery(FullTextQuery.match("hello", "body"))
             .build();
-    StructType scoreSchema = new StructType().add(LanceConstant.SCORE, DataTypes.FloatType);
+    StructType scoreSchema =
+        new StructType()
+            .add(
+                LanceConstant.SCORE,
+                DataTypes.FloatType,
+                true,
+                MetadataAttribute.apply(LanceConstant.SCORE, DataTypes.FloatType, true).metadata());
     return new LanceScanBuilder(
         scoreSchema, options, Collections.emptyMap(), namespaceImpl, Collections.emptyMap());
   }
@@ -274,6 +284,18 @@ public class LanceScanBuilderTest {
     LanceSearchScan scan = (LanceSearchScan) builder.build();
     LanceSearchInputPartition partition = (LanceSearchInputPartition) scan.planInputPartitions()[0];
     return partition.getQuery().toQueryTableRequest().getK();
+  }
+
+  @Test
+  public void testFtsTopNDoesNotPushForStoredScore() {
+    LanceScanBuilder builder = createFtsScoreBuilder("dir");
+    builder.pruneColumns(new StructType().add(LanceConstant.SCORE, DataTypes.FloatType));
+    SortOrder scoreDescending =
+        new TestSortOrder(LanceConstant.SCORE, SortDirection.DESCENDING, NullOrdering.NULLS_LAST);
+    SortOrder scoreAscending =
+        new TestSortOrder(LanceConstant.SCORE, SortDirection.ASCENDING, NullOrdering.NULLS_FIRST);
+    assertFalse(builder.pushTopN(new SortOrder[] {scoreDescending}, 2));
+    assertFalse(builder.pushTopN(new SortOrder[] {scoreAscending}, 2));
   }
 
   @Test
